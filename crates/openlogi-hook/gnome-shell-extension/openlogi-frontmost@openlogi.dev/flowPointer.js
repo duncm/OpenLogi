@@ -9,6 +9,13 @@ const INTERFACE = `<node><interface name="org.openlogi.FlowPointer">
         <arg type="s" direction="in"/>
         <arg type="i" direction="out"/><arg type="i" direction="out"/><arg type="b" direction="out"/>
     </method>
+    <method name="FinishPlacement">
+        <arg type="s" direction="in"/><arg type="b" direction="in"/>
+    </method>
+    <method name="PreparePointerMonotonic">
+        <arg type="s" direction="in"/><arg type="d" direction="in"/><arg type="d" direction="in"/>
+        <arg type="t" direction="in"/><arg type="b" direction="out"/>
+    </method>
     <method name="PlacePointerMonotonic">
         <arg type="s" direction="in"/><arg type="d" direction="in"/><arg type="d" direction="in"/>
         <arg type="t" direction="in"/><arg type="b" direction="out"/>
@@ -19,6 +26,7 @@ const Phase = Object.freeze({
     Idle: 'idle',
     Preparing: 'preparing',
     Waiting: 'waiting',
+    Reserved: 'reserved',
     Finished: 'finished',
 });
 
@@ -38,6 +46,8 @@ export class CursorPlacement {
         this.#state = to;
         if (from.phase === Phase.Waiting)
             from.timer.destroy();
+        if (from.reservation && from.reservation !== to.reservation)
+            from.reservation.unwatch?.();
         if (from.request && from.request !== to.request) {
             for (const release of from.request.cleanup.reverse()) {
                 try {
@@ -46,18 +56,34 @@ export class CursorPlacement {
                     console.debug(`OpenLogi Flow tracker cleanup failed: ${error.message}`);
                 }
             }
-            from.request.reply(confirmed);
+            from.request.reply(confirmed && this.#state === to);
         }
         return this.#state === to;
     }
 
     cancel() {
         const current = this.#state;
-        if (current.phase === Phase.Preparing || current.phase === Phase.Waiting)
+        if (current.phase !== Phase.Idle && current.phase !== Phase.Finished)
             this.#transition(current, {phase: Phase.Finished});
     }
 
-    place(targetX, targetY, expiresUs, reply) {
+    finish(rollback) {
+        const current = this.#state;
+        if (!current.reservation)
+            return;
+        const saved = current.reservation;
+        if (!this.#transition(current, {phase: Phase.Finished}) ||
+            current.phase !== Phase.Reserved || !rollback || saved.touched)
+            return;
+        const [x, y] = this._desktop.pointer();
+        // Without a native event filter, require idle time spanning the reservation.
+        const untouched = saved.unwatch ||
+            this._desktop.idleMs?.() * 1000 > GLib.get_monotonic_time() - saved.started;
+        if (untouched && x === saved.x && y === saved.y)
+            this._desktop.warp(saved.original[0], saved.original[1]);
+    }
+
+    place(targetX, targetY, expiresUs, reply, reserve = false) {
         const x = Math.round(targetX);
         const y = Math.round(targetY);
         const now = GLib.get_monotonic_time();
@@ -69,7 +95,10 @@ export class CursorPlacement {
         }
 
         const request = {reply, cleanup: []};
-        const preparing = {phase: Phase.Preparing, request};
+        const reservation = reserve
+            ? {x, y, original: this._desktop.pointer(), started: now, touched: false}
+            : null;
+        const preparing = {phase: Phase.Preparing, request, reservation};
         if (!this.#transition(this.#state, preparing))
             return;
 
@@ -88,11 +117,22 @@ export class CursorPlacement {
             if (current.phase !== Phase.Waiting || current.request !== request)
                 return;
             const [actualX, actualY] = this._desktop.pointer();
-            if (actualX === x && actualY === y)
-                this.#transition(current, {phase: Phase.Finished}, GLib.get_monotonic_time() < deadline);
+            if (actualX === x && actualY === y) {
+                const confirmed = GLib.get_monotonic_time() < deadline;
+                const next = confirmed && reservation ? {phase: Phase.Reserved, reservation} : {phase: Phase.Finished};
+                this.#transition(current, next, confirmed);
+            }
         };
 
         try {
+            if (reservation) {
+                const unwatch = this._desktop.watchInput?.(() => { reservation.touched = true; });
+                if (this.#state !== preparing) {
+                    unwatch?.();
+                    return;
+                }
+                reservation.unwatch = unwatch;
+            }
             const tracker = this._desktop.tracker();
             const signal = tracker.connect('position-invalidated', check);
             if (!keep(() => tracker.disconnect(signal)))
@@ -104,7 +144,7 @@ export class CursorPlacement {
             }
             const timeoutMs = Math.max(1, Math.ceil((deadline - GLib.get_monotonic_time()) / 1000));
             const timer = GLib.timeout_source_new(timeoutMs);
-            const waiting = {phase: Phase.Waiting, request, timer};
+            const waiting = {phase: Phase.Waiting, request, reservation, timer};
             timer.set_callback(() => {
                 this.#transition(waiting, {phase: Phase.Finished});
                 return GLib.SOURCE_REMOVE;
@@ -184,10 +224,25 @@ export class FlowPointer {
             call.return_value(new GLib.Variant('(iib)', this._desktop.pointer()));
     }
 
-    PlacePointerMonotonicAsync([generation, targetX, targetY, expiresUs], call) {
+    FinishPlacementAsync([generation, rollback], call) {
+        if (this._allowed(call, generation)) {
+            this._placement.finish(rollback);
+            call.return_value(null);
+        }
+    }
+
+    PreparePointerMonotonicAsync(args, call) {
+        this._place(args, call, true);
+    }
+
+    PlacePointerMonotonicAsync(args, call) {
+        this._place(args, call, false);
+    }
+
+    _place([generation, targetX, targetY, expiresUs], call, reserve) {
         if (!this._allowed(call, generation))
             return;
         this._placement.place(targetX, targetY, expiresUs,
-            ok => call.return_value(new GLib.Variant('(b)', [ok])));
+            ok => call.return_value(new GLib.Variant('(b)', [ok])), reserve);
     }
 }

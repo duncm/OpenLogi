@@ -51,6 +51,23 @@ impl Probe {
         }
     }
 
+    pub(crate) fn prepare_warp(
+        &mut self,
+        to: DesktopPoint,
+        deadline: std::time::Instant,
+    ) -> Result<bool, WarpError> {
+        match self {
+            Self::Gnome(p) => p.prepare_warp(to, deadline),
+            Self::X11(_) => Ok(false),
+        }
+    }
+
+    pub(crate) fn finish_placement(&self, rollback: bool) {
+        if let Self::Gnome(gnome) = self {
+            gnome.finish_placement(rollback);
+        }
+    }
+
     pub(crate) fn warp(&mut self, to: DesktopPoint) -> Result<(), WarpError> {
         match self {
             Self::X11(p) => p.warp(to),

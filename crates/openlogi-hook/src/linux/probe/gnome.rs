@@ -2,7 +2,10 @@
 //! a token the extension invalidates on lock, monitor or controller changes.
 //! An old layout can never move the cursor or produce a new pointer sample.
 
-use std::{io, time::Duration};
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 
 use rustix::time::{ClockId, clock_gettime};
 
@@ -23,6 +26,14 @@ type Rect = (i32, i32, i32, i32);
 trait FlowPointer {
     fn get_layout(&self) -> zbus::Result<(String, Vec<Rect>)>;
     fn read_pointer(&self, generation: &str) -> zbus::Result<(i32, i32, bool)>;
+    fn finish_placement(&self, generation: &str, rollback: bool) -> zbus::Result<()>;
+    fn prepare_pointer_monotonic(
+        &self,
+        generation: &str,
+        x: f64,
+        y: f64,
+        deadline_us: u64,
+    ) -> zbus::Result<bool>;
     fn place_pointer_monotonic(
         &self,
         generation: &str,
@@ -138,20 +149,62 @@ impl Probe {
         })
     }
 
+    pub(super) fn finish_placement(&self, rollback: bool) {
+        if let Phase::Ready { proxy, generation } = &self.phase {
+            let _ = proxy.finish_placement(generation, rollback);
+        }
+    }
+
+    fn placement_deadline(worker_deadline: Option<Instant>) -> Result<u64, WarpError> {
+        // Sample the clock shared with GLib first: time spent translating a
+        // worker deadline must never extend the budget sent to Shell.
+        let now = Duration::try_from(clock_gettime(ClockId::Monotonic))
+            .map_err(|error| WarpError::Rejected(io::Error::other(error)))?;
+        let cap = Duration::from_millis(500);
+        let budget = worker_deadline.map_or(cap, |end| {
+            cap.min(end.saturating_duration_since(Instant::now()))
+        });
+        u64::try_from((now + budget).as_micros())
+            .map_err(|error| WarpError::Rejected(io::Error::other(error)))
+    }
+
+    pub(super) fn prepare_warp(
+        &self,
+        to: DesktopPoint,
+        deadline: Instant,
+    ) -> Result<bool, WarpError> {
+        let Phase::Ready { proxy, generation } = &self.phase else {
+            return Err(WarpError::OutsideDisplays);
+        };
+        match proxy.prepare_pointer_monotonic(
+            generation,
+            to.x,
+            to.y,
+            Self::placement_deadline(Some(deadline))?,
+        ) {
+            Err(zbus::Error::MethodError(name, ..))
+                if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod" =>
+            {
+                Ok(false)
+            }
+            result => Self::confirm(result).map(|()| true),
+        }
+    }
+
     pub(super) fn warp(&self, to: DesktopPoint) -> Result<(), WarpError> {
         let Phase::Ready { proxy, generation } = &self.phase else {
             return Err(WarpError::OutsideDisplays);
         };
-        // GLib.get_monotonic_time() in Linux Shell uses CLOCK_MONOTONIC.
-        // The absolute deadline includes time queued on the session bus.
-        let now = Duration::try_from(clock_gettime(ClockId::Monotonic))
-            .map_err(|error| WarpError::Rejected(io::Error::other(error)))?;
-        let deadline_us = u64::try_from((now + Duration::from_millis(500)).as_micros())
-            .map_err(|error| WarpError::Rejected(io::Error::other(error)))?;
-        if proxy
-            .place_pointer_monotonic(generation, to.x, to.y, deadline_us)
-            .map_err(|e| WarpError::Rejected(io::Error::other(e)))?
-        {
+        Self::confirm(proxy.place_pointer_monotonic(
+            generation,
+            to.x,
+            to.y,
+            Self::placement_deadline(None)?,
+        ))
+    }
+
+    fn confirm(result: zbus::Result<bool>) -> Result<(), WarpError> {
+        if result.map_err(|error| WarpError::Rejected(io::Error::other(error)))? {
             Ok(())
         } else {
             Err(WarpError::Rejected(io::Error::other(
