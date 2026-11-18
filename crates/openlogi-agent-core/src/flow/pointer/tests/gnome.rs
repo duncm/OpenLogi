@@ -191,15 +191,32 @@ fn check_private_bus() {
     }
     drop(state);
 
+    check_preposition();
     measure_motion();
 }
 
 fn assert_queued_placement_expires(pointer: &mut PointerProbe) {
-    call("SimulateLateDelivery", &["true"]);
+    let target = DesktopPoint { x: 80.0, y: 90.0 };
     let before = call("Stats", &[]);
     assert!(
-        pointer.warp(DesktopPoint { x: 80.0, y: 90.0 }).is_err(),
+        pointer
+            .prepare_warp(target, std::time::Instant::now())
+            .is_err(),
+        "an exhausted worker budget must not become a fresh Shell deadline"
+    );
+    call("SimulateLateDelivery", &["true"]);
+    assert!(
+        pointer.warp(target).is_err(),
         "a queued placement must expire even if the wall clock moves backwards"
+    );
+    assert!(
+        pointer
+            .prepare_warp(
+                target,
+                std::time::Instant::now() + Duration::from_millis(750)
+            )
+            .is_err(),
+        "a queued reservation must expire on the same clock as ordinary placement"
     );
     assert_eq!(call("Stats", &[]), before, "expired call reached the seat");
     call("SimulateLateDelivery", &["false"]);
@@ -220,6 +237,69 @@ fn assert_other_caller_denied() {
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&denied.stderr).contains("AccessDenied"));
+}
+
+fn check_preposition() {
+    let runtime = openlogi_core::worker::runtime().unwrap();
+    call("Mode", &["delayed"]);
+    call("Move", &["45", "87", "false"]);
+    let e = entry(proto::Side::Left, 1.0 / 3.0);
+    let (crossings, _) = tokio::sync::mpsc::channel(1);
+    let thread = PointerThread::spawn(crossings).unwrap();
+    assert!(runtime.block_on(thread.prepare(e.clone())));
+    assert_eq!(
+        call("Position", &[]).trim(),
+        "(-1278, 360)",
+        "ready includes completed placement"
+    );
+    thread.finish_placement(true);
+    thread.stop();
+    assert_eq!(
+        call("Position", &[]).trim(),
+        "(45, 87)",
+        "untouched cancellation rolls back"
+    );
+
+    for cancel in [false, true] {
+        let (crossings, _) = tokio::sync::mpsc::channel(1);
+        let thread = PointerThread::spawn(crossings).unwrap();
+        assert!(runtime.block_on(thread.prepare(e.clone())));
+        call("Move", &["27", "90", "false"]);
+        if cancel {
+            // Even returning by hand to the exact same pixel invalidates rollback.
+            call("Move", &["-1278", "360", "false"]);
+        } else {
+            thread.place(e.clone()); // Late inventory report after physical movement.
+        }
+        thread.finish_placement(cancel);
+        thread.stop();
+        let expected = if cancel { "(-1278, 360)" } else { "(27, 90)" };
+        assert_eq!(call("Position", &[]).trim(), expected, "user keeps control");
+    }
+    // The receiver must not acknowledge an attempted but unconfirmed warp.
+    call("Mode", &["confined"]);
+    call("Move", &["27", "90", "false"]);
+    let (crossings, _) = tokio::sync::mpsc::channel(1);
+    let thread = PointerThread::spawn(crossings).unwrap();
+    assert!(!runtime.block_on(thread.prepare(e.clone())));
+    thread.stop();
+    assert_eq!(call("Position", &[]).trim(), "(27, 90)");
+    call("Mode", &["v4"]);
+    let (crossings, _) = tokio::sync::mpsc::channel(1);
+    let thread = PointerThread::spawn(crossings).unwrap();
+    assert!(runtime.block_on(thread.prepare(e.clone())));
+    assert_eq!(
+        call("Position", &[]).trim(),
+        "(27, 90)",
+        "v4 defers placement"
+    );
+    thread.place(e);
+    thread.stop();
+    assert_eq!(
+        call("Position", &[]).trim(),
+        "(-1278, 360)",
+        "v4 places on arrival"
+    );
 }
 
 fn measure_motion() {

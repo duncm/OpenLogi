@@ -58,7 +58,7 @@ impl LocalDevice {
 
     /// Whether the device moves the cursor, so its arrival places the cursor.
     pub(crate) const fn is_pointing(&self) -> bool {
-        is_pointing(self.kind)
+        is_pointing(category(self.kind))
     }
 }
 
@@ -153,6 +153,15 @@ impl LocalDevices {
             .find(|device| same_device(identity, &device.identity).unwrap_or(false))
     }
 
+    /// A paired device may be absent from inventory until arrival. In that
+    /// case the accepted peer's category identifies a pointing transfer.
+    pub(crate) fn is_pointing_request(&self, id: &proto::DeviceIdentity) -> bool {
+        self.find(id).map_or_else(
+            || id.category.as_known().is_some_and(is_pointing),
+            LocalDevice::is_pointing,
+        )
+    }
+
     /// The key of the configured, unlisted device a peer's identity denotes.
     ///
     /// Such a device has no identity here yet: after a restart a Unifying
@@ -231,17 +240,19 @@ fn identity(key: &PhysicalDeviceKey, record: &InventoryDevice) -> Option<proto::
     })
 }
 
-const fn is_pointing(kind: DeviceKind) -> bool {
+const fn is_pointing(kind: proto::DeviceCategory) -> bool {
     matches!(
         kind,
-        DeviceKind::Mouse | DeviceKind::Trackball | DeviceKind::Touchpad
+        proto::DeviceCategory::Mouse
+            | proto::DeviceCategory::Trackball
+            | proto::DeviceCategory::Touchpad
     )
 }
 
 /// Pointing devices move first so the cursor follows the user's hand;
 /// keyboards move last.
 const fn handoff_rank(kind: DeviceKind) -> u8 {
-    if is_pointing(kind) {
+    if is_pointing(category(kind)) {
         0
     } else if kind.is_keyboard_family() {
         2

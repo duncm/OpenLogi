@@ -86,7 +86,7 @@ pub(super) struct Actor {
     events_tx: mpsc::Sender<Event>,
     crossings: mpsc::Receiver<EdgeCrossing>,
     /// False once the pointer thread has gone, which it does at once when
-    /// this session has no pointer probe (Wayland, or no display). Incoming
+    /// this session has no usable pointer backend. Incoming
     /// handoffs still work; only outgoing ones need a crossing.
     crossings_open: bool,
     stop: watch::Receiver<bool>,
@@ -153,7 +153,7 @@ impl Actor {
                 biased;
                 _ = self.stop.changed() => break,
                 event = self.events.recv() => match event {
-                    Some(event) => self.handle(event),
+                    Some(event) => self.handle(event).await,
                     None => break,
                 },
                 changed = self.inventory.changed() => {
@@ -191,10 +191,10 @@ impl Actor {
         }
     }
 
-    fn handle(&mut self, event: Event) {
+    async fn handle(&mut self, event: Event) {
         match event {
             Event::Link { peer, state } => self.link_changed(peer, state),
-            Event::Request { peer, rpc } => self.request(peer, rpc),
+            Event::Request { peer, rpc } => self.request(peer, rpc).await,
             Event::Notification { peer, envelope } => self.notification(peer, &envelope),
             Event::Sent {
                 transfer_id,
@@ -316,11 +316,11 @@ impl Actor {
         info!(transfer = transfer_id, ?report, "Flow handoff sent");
     }
 
-    fn request(&mut self, peer: PublicKey, rpc: IncomingRpc) {
+    async fn request(&mut self, peer: PublicKey, rpc: IncomingRpc) {
         let request = rpc.request();
         let encoded = if request.kind == FrameKind::HandoffRequest {
             match request.decode::<proto::HandoffRequest>(InboundRole::Request) {
-                Ok(request) => self.handoff_request(peer, &request),
+                Ok(request) => self.handoff_request(peer, &request).await,
                 Err(_) => error_envelope(proto::ErrorCode::Invalid, "malformed handoff request"),
             }
         } else {
@@ -347,7 +347,7 @@ impl Actor {
         });
     }
 
-    fn handoff_request(
+    async fn handoff_request(
         &mut self,
         peer: PublicKey,
         request: &proto::HandoffRequest,
@@ -361,6 +361,22 @@ impl Actor {
         );
         match &decision {
             ArmDecision::Armed(accept) => {
+                if request
+                    .devices
+                    .iter()
+                    .any(|id| self.devices.is_pointing_request(id))
+                    && let Some(entry) = request.entry.as_option()
+                    && !self.pointer.prepare(entry.clone()).await
+                {
+                    self.ledger.cancel(peer, accept.transfer_id);
+                    self.pointer.finish_placement(true);
+                    let reject = super::super::handoff::reject(
+                        accept.transfer_id,
+                        proto::HandoffRejectReason::NotReady,
+                        "entry cursor could not be prepared",
+                    );
+                    return message_envelope(FrameKind::HandoffReject, &reject);
+                }
                 info!(transfer = accept.transfer_id, "Flow handoff armed");
                 message_envelope(FrameKind::HandoffAccept, accept)
             }
@@ -386,6 +402,7 @@ impl Actor {
                 };
                 match self.ledger.cancel(peer, cancel.transfer_id) {
                     CancelOutcome::Disarmed => {
+                        self.pointer.finish_placement(true);
                         info!(transfer = cancel.transfer_id, "Flow handoff cancelled");
                     }
                     CancelOutcome::Ignored => {
@@ -439,6 +456,7 @@ impl Actor {
     }
 
     fn finish(&self, done: &CompletedTransfer) {
+        self.pointer.finish_placement(false);
         info!(
             transfer = done.result.transfer_id,
             outcome = ?done.result.outcome,

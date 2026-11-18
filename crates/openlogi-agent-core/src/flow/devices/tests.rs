@@ -14,6 +14,26 @@ fn keys(devices: &LocalDevices) -> Vec<&str> {
 }
 
 #[test]
+fn entry_placement_uses_the_local_kind_or_the_unlisted_devices_category() {
+    let config = config(vec![
+        configured(KEYBOARD, Some(1)),
+        configured(MOUSE, Some(1)),
+    ]);
+    let devices = LocalDevices::join(
+        &config,
+        &[record(KEYBOARD, DeviceKind::Keyboard, 0x0b, false)],
+    );
+    let mut keyboard = unit_identity(0x0b);
+    keyboard.category = proto::DeviceCategory::Mouse.into();
+    assert!(!devices.is_pointing_request(&keyboard));
+
+    let mut missing = unit_identity(0x0a);
+    assert!(!devices.is_pointing_request(&missing));
+    missing.category = proto::DeviceCategory::Trackball.into();
+    assert!(devices.is_pointing_request(&missing));
+}
+
+#[test]
 fn join_orders_pointing_devices_first_and_keyboards_last() {
     let config = config(vec![
         configured(KEYBOARD, Some(1)),

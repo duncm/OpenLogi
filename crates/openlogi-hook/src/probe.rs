@@ -145,6 +145,45 @@ impl PointerProbe {
         None
     }
 
+    /// Whether this backend can attempt placement before the sender switches.
+    #[must_use]
+    pub fn prepositions_entry(&self) -> bool {
+        cfg!(target_os = "windows") || self.layout_generation().is_some()
+    }
+
+    /// End a prepared placement. On explicit cancellation, the window system
+    /// restores the previous point only while the user has left it untouched.
+    pub fn finish_placement(&mut self, rollback: bool) {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        self.inner.finish_placement(rollback);
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        let _ = rollback;
+    }
+
+    /// Reserve an early placement. Returns false when the backend waits for arrival.
+    ///
+    /// The deadline bounds the move even if a display query holds up the worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns a warp error if the target moved outside the layout or placement failed.
+    pub fn prepare_warp(
+        &mut self,
+        to: DesktopPoint,
+        deadline: std::time::Instant,
+    ) -> Result<bool, WarpError> {
+        self.validate_target(to)?;
+        #[cfg(target_os = "linux")]
+        return self.inner.prepare_warp(to, deadline);
+        #[cfg(target_os = "windows")]
+        return self.inner.prepare_warp(to, deadline).map(|()| true);
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            let _ = deadline;
+            Ok(false)
+        }
+    }
+
     /// Move the cursor to `to`, which must lie on an active display.
     ///
     /// # Errors
@@ -152,6 +191,18 @@ impl PointerProbe {
     /// [`WarpError::OutsideDisplays`] when no active display contains `to`, and
     /// [`WarpError::Rejected`] when the window system refuses the move.
     pub fn warp(&mut self, to: DesktopPoint) -> Result<(), WarpError> {
+        self.validate_target(to)?;
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            self.inner.warp(to)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            match self.never {}
+        }
+    }
+
+    fn validate_target(&mut self, to: DesktopPoint) -> Result<(), WarpError> {
         let previous = self.layout_generation().map(str::to_owned);
         if !self.displays().iter().any(|display| display.contains(to)) {
             return Err(WarpError::OutsideDisplays);
@@ -164,14 +215,7 @@ impl PointerProbe {
                 "display layout changed",
             )));
         }
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-        {
-            self.inner.warp(to)
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        {
-            match self.never {}
-        }
+        Ok(())
     }
 }
 

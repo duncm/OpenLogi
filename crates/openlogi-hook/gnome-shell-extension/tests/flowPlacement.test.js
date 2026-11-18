@@ -15,6 +15,9 @@ function fixture() {
         reads: 0,
         warps: 0,
         tracking: 0,
+        guards: 0,
+        onWatch() {},
+        onUntrack() {},
         onTrack() {},
         onWarp() {},
     };
@@ -33,19 +36,28 @@ function fixture() {
         untrack_position() {
             assert(state.tracking > 0, 'tracking released more than once');
             state.tracking--;
+            state.onUntrack();
         },
     };
     const placement = new CursorPlacement({
         monitors: () => [{x: 0, y: 0, width: 100, height: 100}],
         tracker: () => tracker,
+        watchInput() {
+            state.guards++;
+            state.onWatch();
+            return () => {
+                assert(state.guards > 0, 'input guard released more than once');
+                state.guards--;
+            };
+        },
         pointer() { state.reads++; return state.position; },
         warp() { state.warps++; state.onWarp(); },
     });
     return {
         state, placement, listeners,
-        start() {
+        start(reserve = false) {
             const replies = [];
-            placement.place(10, 12, GLib.get_monotonic_time() + 500_000, ok => replies.push(ok));
+            placement.place(10, 12, GLib.get_monotonic_time() + 500_000, ok => replies.push(ok), reserve);
             return replies;
         },
         assertReleased() {
@@ -97,6 +109,40 @@ function cancellationDuringSetup() {
     f.assertReleased();
 }
 
+function reservedPlacement() {
+    const f = fixture();
+    f.state.onWarp = () => { f.state.position = [10, 12]; };
+    const first = f.start(true);
+    assert(first.length === 1 && first[0] && f.state.guards === 1, 'reservation lost its input guard');
+    f.assertReleased();
+    const next = f.start();
+    assert(next.length === 1 && next[0] && f.state.guards === 0, 'ordinary placement retained a guard');
+    f.placement.finish(true);
+    assert(f.state.warps === 2, 'superseded reservation restored its original point');
+}
+
+function cancelledReservation() {
+    const f = fixture();
+    f.state.onWatch = () => f.placement.cancel();
+    const replies = f.start(true);
+    assert(replies.length === 1 && !replies[0], 'invalidated reservation must fail once');
+    assert(f.state.guards === 0 && f.state.warps === 0, 'cancelled guard leaked or warped');
+    f.assertReleased();
+}
+
+function invalidatedDuringConfirmation() {
+    const f = fixture();
+    f.state.onWarp = () => { f.state.position = [10, 12]; };
+    f.state.onUntrack = () => f.placement.cancel();
+    const replies = f.start(true);
+    assert(replies.length === 1 && !replies[0], 'acknowledged an invalidated reservation');
+    assert(f.state.guards === 0, 'invalidated reservation retained a guard');
+    f.assertReleased();
+}
+
 synchronousNotifications();
 supersededCallback();
 cancellationDuringSetup();
+reservedPlacement();
+cancelledReservation();
+invalidatedDuringConfirmation();

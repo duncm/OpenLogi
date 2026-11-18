@@ -14,8 +14,8 @@
 //! - A cancel disarms the transfer only while no device has arrived. After an
 //!   arrival the moved devices are usable here, so the transfer completes and
 //!   reports what arrived.
-//! - The cursor is placed when the first pointing device arrives, not when
-//!   the whole transfer completes.
+//! - The first pointing arrival commits its prepared cursor position, or
+//!   triggers placement on a backend that places on arrival.
 //!
 //! Sender rules:
 //! - Every switch write must start before [`SwitchSchedule::may_write`] turns
@@ -110,7 +110,7 @@ pub(crate) struct CompletedTransfer {
 /// What one inventory update changed for the armed transfer.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Observation {
-    /// The first pointing device just arrived: place the cursor here.
+    /// The first pointing arrival commits the entry or triggers placement.
     pub(crate) entry: Option<proto::EntryPoint>,
     /// Every device arrived, so the transfer finished.
     pub(crate) completed: Option<CompletedTransfer>,
@@ -463,7 +463,7 @@ fn accept(transfer_id: u64, window: Duration) -> proto::HandoffAccept {
     }
 }
 
-fn reject(
+pub(super) fn reject(
     transfer_id: u64,
     reason: proto::HandoffRejectReason,
     detail: &str,

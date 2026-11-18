@@ -57,6 +57,22 @@ export default class OpenLogiFrontmostExtension extends Extension {
                 },
                 tracker: () => global.backend?.get_cursor_tracker?.()
                     ?? Meta.CursorTracker.get_for_display(global.display),
+                idleMs: () => global.backend?.get_core_idle_monitor?.()?.get_idletime(),
+                watchInput: touched => {
+                    if (!Clutter.Event?.add_filter || !Clutter.Event.remove_filter)
+                        return null;
+                    const seat = Clutter.get_default_backend().get_default_seat();
+                    const id = Clutter.Event.add_filter(global.stage, event => {
+                        const type = event.type();
+                        // Ignore crossing notifications and Mutter's own synthetic warp.
+                        if (![Clutter.EventType.NOTHING, Clutter.EventType.ENTER, Clutter.EventType.LEAVE].includes(type) &&
+                            !(type === Clutter.EventType.MOTION && event.get_time() === 0 &&
+                              event.get_source_device() === seat.get_pointer()))
+                            touched();
+                        return Clutter.EVENT_PROPAGATE;
+                    });
+                    return () => Clutter.Event.remove_filter(id);
+                },
                 warp: (x, y) => Clutter.get_default_backend().get_default_seat().warp_pointer(x, y),
             });
             this._layoutChanged = Main.layoutManager.connect('monitors-changed', () => this._flow.invalidate());

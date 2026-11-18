@@ -14,7 +14,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    GetLastInputInfo, LASTINPUTINFO, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
 use windows_sys::core::BOOL;
@@ -22,8 +22,26 @@ use windows_sys::core::BOOL;
 use super::hook::key_held;
 use crate::{DesktopPoint, DisplayBounds, KeyModifiers, PointerState, WarpError};
 
-/// The Windows probe. Win32 needs no connection, so it holds nothing.
-pub(crate) struct Probe;
+/// The Windows probe keeps the previous cursor and input stamp for cancellation.
+pub(crate) struct Probe {
+    reservation: Option<Reservation>,
+}
+
+struct Reservation {
+    original: DesktopPoint,
+    placed: DesktopPoint,
+    last_input: u32,
+    displays: Vec<DisplayBounds>,
+}
+
+fn last_input() -> Option<u32> {
+    let mut info = LASTINPUTINFO {
+        cbSize: u32::try_from(size_of::<LASTINPUTINFO>()).ok()?,
+        dwTime: 0,
+    };
+    // SAFETY: info is writable and advertises its exact structure size.
+    (unsafe { GetLastInputInfo(&raw mut info) } != 0).then_some(info.dwTime)
+}
 
 impl Probe {
     #[expect(
@@ -31,7 +49,7 @@ impl Probe {
         reason = "the probe API is the same on every platform; X11 can fail to connect"
     )]
     pub(crate) fn connect() -> Option<Self> {
-        Some(Self)
+        Some(Self { reservation: None })
     }
 
     #[expect(
@@ -80,17 +98,72 @@ impl Probe {
         displays
     }
 
-    #[expect(
-        clippy::unused_self,
-        reason = "the probe API is the same on every platform; X11 needs its connection here"
-    )]
-    pub(crate) fn warp(&mut self, to: DesktopPoint) -> Result<(), WarpError> {
-        // SAFETY: `SetCursorPos` takes both coordinates by value.
-        if unsafe { SetCursorPos(screen_pixel(to.x), screen_pixel(to.y)) } == 0 {
-            return Err(WarpError::Rejected(io::Error::last_os_error()));
+    pub(crate) fn prepare_warp(
+        &mut self,
+        to: DesktopPoint,
+        deadline: std::time::Instant,
+    ) -> Result<(), WarpError> {
+        self.reservation = None;
+        let activity = last_input();
+        let before = self.state().map(|state| state.position);
+        let displays = self.displays();
+        if std::time::Instant::now() >= deadline {
+            return Err(WarpError::Rejected(io::Error::from(
+                io::ErrorKind::TimedOut,
+            )));
+        }
+        set_position(to)?;
+        let placed = DesktopPoint {
+            x: to.x.round(),
+            y: to.y.round(),
+        };
+        let position = self.state().map(|state| state.position);
+        if let Some(stamp) = activity
+            && last_input() == Some(stamp)
+        {
+            if position != Some(placed) {
+                return Err(WarpError::Rejected(io::Error::other(
+                    "Windows did not confirm cursor placement",
+                )));
+            }
+            self.reservation = before.map(|original| Reservation {
+                original,
+                placed,
+                last_input: stamp,
+                displays,
+            });
         }
         Ok(())
     }
+
+    #[expect(
+        clippy::unused_self,
+        reason = "the X11 probe uses its display connection"
+    )]
+    pub(crate) fn warp(&mut self, to: DesktopPoint) -> Result<(), WarpError> {
+        set_position(to)
+    }
+
+    pub(crate) fn finish_placement(&mut self, rollback: bool) {
+        if let Some(saved) = self.reservation.take()
+            && rollback
+            && saved.displays == self.displays()
+            && self
+                .state()
+                .is_some_and(|state| state.position == saved.placed)
+            && last_input() == Some(saved.last_input)
+        {
+            let _ = set_position(saved.original);
+        }
+    }
+}
+
+fn set_position(to: DesktopPoint) -> Result<(), WarpError> {
+    // SAFETY: SetCursorPos takes both coordinates by value.
+    if unsafe { SetCursorPos(screen_pixel(to.x), screen_pixel(to.y)) } == 0 {
+        return Err(WarpError::Rejected(io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 /// `EnumDisplayMonitors` callback: append one monitor's bounds to the
