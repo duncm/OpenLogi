@@ -17,8 +17,10 @@ restores GNOME's original policy. The global animation setting is never changed.
 
 On an unlocked GNOME Wayland desktop the extension also supplies Flow with the
 logical monitor rectangles, cursor position and Control-key state. The Flow
-worker samples the pointer on motion and dwell, and places it at the entry
-edge when the first pointing device arrives.
+worker samples the pointer on motion and dwell. With version 6 of the
+companion, it places the destination cursor just inside the entry edge
+before accepting a pointing-device handoff. Move the mouse as soon as it
+arrives. The later device report leaves it where you moved it.
 
 ## D-Bus surface
 
@@ -33,8 +35,15 @@ name. Its methods accept the session-bus owner of `org.openlogi.OpenLogi.Flow`.
 `PlacePointerMonotonic` require that generation. Placement carries an absolute
 Linux monotonic deadline in microseconds, including time spent waiting on the
 bus. Use the agent and companion from the same build for cursor placement.
-Lock, monitor changes, controller
-replacement, and extension disable invalidate it.
+Locking the session, changing monitors, replacing the controller, or disabling
+the extension invalidates the layout generation.
+
+Version 6 adds `PreparePointerMonotonic` to reserve a placement under the same
+deadline and `FinishPlacement` to release it. During the reservation Shell observes input activity. If the
+sender cancels before any device arrives, Shell restores the previous position
+only while the entry cursor is untouched. An agent from the GNOME edge fix can still call `PlacePointerMonotonic`
+on arrival. An updated agent paired with the version 4 companion from that fix
+also places on arrival.
 
 ## Install
 

@@ -52,7 +52,13 @@ pub(crate) struct PointerSettings {
 
 enum Command {
     Configure(PointerSettings),
+    Prepare(
+        proto::EntryPoint,
+        Instant,
+        tokio::sync::oneshot::Sender<bool>,
+    ),
     Place(proto::EntryPoint),
+    Finish(bool),
     Stop,
 }
 
@@ -67,6 +73,13 @@ pub(crate) trait Pointer {
     fn layout_generation(&self) -> Option<&str> {
         None
     }
+    fn prepositions_entry(&self) -> bool {
+        false
+    }
+    fn prepare_warp(&mut self, _to: HookPoint, _deadline: Instant) -> Result<bool, WarpError> {
+        Ok(false)
+    }
+    fn finish_placement(&mut self, _rollback: bool) {}
     /// Move the cursor.
     fn warp(&mut self, to: HookPoint) -> Result<(), WarpError>;
 }
@@ -82,6 +95,16 @@ impl Pointer for PointerProbe {
 
     fn layout_generation(&self) -> Option<&str> {
         Self::layout_generation(self)
+    }
+
+    fn prepositions_entry(&self) -> bool {
+        Self::prepositions_entry(self)
+    }
+    fn prepare_warp(&mut self, to: HookPoint, deadline: Instant) -> Result<bool, WarpError> {
+        Self::prepare_warp(self, to, deadline)
+    }
+    fn finish_placement(&mut self, rollback: bool) {
+        Self::finish_placement(self, rollback);
     }
 
     fn warp(&mut self, to: HookPoint) -> Result<(), WarpError> {
@@ -179,7 +202,24 @@ impl PointerThread {
         self.send(Command::Configure(settings));
     }
 
-    /// Place the cursor at a handoff's entry point.
+    /// Complete the destination placement before the peer is allowed to write.
+    /// A headless worker drops the reply, leaving hardware reception available.
+    pub(crate) async fn prepare(&self, entry: proto::EntryPoint) -> bool {
+        let (reply, ready) = tokio::sync::oneshot::channel();
+        let deadline = Instant::now() + Duration::from_millis(750);
+        self.send(Command::Prepare(entry, deadline, reply));
+        // Leave time for the request reply and hardware writes even if the
+        // desktop restarts mid-query. A gone/headless worker needs no wait.
+        tokio::time::timeout_at(deadline.into(), ready)
+            .await
+            .is_ok_and(|result| result.unwrap_or(true))
+    }
+
+    pub(crate) fn finish_placement(&self, rollback: bool) {
+        self.send(Command::Finish(rollback));
+    }
+
+    /// Commit the first pointing arrival, placing it on backends that wait for arrival.
     pub(crate) fn place(&self, entry: proto::EntryPoint) {
         self.send(Command::Place(entry));
     }
@@ -219,12 +259,46 @@ fn run<P: Pointer>(
     let epoch = Instant::now();
     let mut state = PointerLoop::new(pointer, Duration::ZERO);
     let mut settle_at = None;
+    let mut prepared = false;
     loop {
         loop {
             match commands.try_recv() {
                 Ok(Command::Configure(settings)) => state.configure(settings),
-                Ok(Command::Place(entry)) => state.place(&entry),
-                Ok(Command::Stop) | Err(TryRecvError::Disconnected) => return,
+                Ok(Command::Prepare(entry, deadline, reply)) => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = state.prepare(&entry, deadline);
+                    prepared = matches!(result, Ok(true));
+                    if prepared {
+                        settle_at = None;
+                        moved.store(false, Ordering::Release);
+                    }
+                    if let Err(error) = &result {
+                        // A lost reply can leave a reservation in the compositor.
+                        state.pointer.finish_placement(true);
+                        warn!(%error, "Flow could not prepare the entry cursor");
+                    }
+                    let _ = reply.send(result.is_ok());
+                }
+                Ok(Command::Place(entry)) => {
+                    if std::mem::take(&mut prepared) {
+                        state.pointer.finish_placement(false);
+                    } else {
+                        state.place(&entry);
+                    }
+                }
+                Ok(Command::Finish(rollback)) => {
+                    if std::mem::take(&mut prepared) {
+                        state.pointer.finish_placement(rollback);
+                    }
+                }
+                Ok(Command::Stop) | Err(TryRecvError::Disconnected) => {
+                    if prepared {
+                        state.pointer.finish_placement(false);
+                    }
+                    return;
+                }
                 Err(TryRecvError::Empty) => break,
             }
         }
@@ -359,6 +433,29 @@ impl<P: Pointer> PointerLoop<P> {
             },
             now,
         )
+    }
+
+    fn prepare(&mut self, entry: &proto::EntryPoint, deadline: Instant) -> Result<bool, WarpError> {
+        if !self.pointer.prepositions_entry() {
+            return Ok(false);
+        }
+        self.refresh_layout();
+        if self.edges.segments().is_empty() {
+            // The companion may be disabled or the desktop locked. Hardware can still arrive.
+            return Ok(false);
+        }
+        let target = entry_position(&self.edges, entry).ok_or(WarpError::OutsideDisplays)?;
+        let placed = self.pointer.prepare_warp(
+            HookPoint {
+                x: target.x,
+                y: target.y,
+            },
+            deadline,
+        )?;
+        if placed {
+            self.detector.set_edges(self.edges.clone());
+        }
+        Ok(placed)
     }
 
     /// Move the cursor to a handoff's entry point.

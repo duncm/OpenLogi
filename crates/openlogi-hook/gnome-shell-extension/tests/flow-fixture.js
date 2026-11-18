@@ -7,13 +7,14 @@ import {FlowPointer} from '../openlogi-frontmost@openlogi.dev/flowPointer.js';
 const wallNow = Date.now;
 const monotonicNow = GLib.get_monotonic_time;
 let position = [0, 0, false];
-const WarpMode = Object.freeze({Delayed: 'delayed', Confined: 'confined', Interrupt: 'interrupt'});
+const WarpMode = Object.freeze({Delayed: 'delayed', Confined: 'confined', Interrupt: 'interrupt', V4: 'v4'});
 let mode = WarpMode.Delayed;
 let reads = 0;
 let warps = 0;
 let callback = null;
 let tracking = 0;
 let active = true;
+let touch = null;
 let service = null;
 const tracker = {
     connect(_name, listener) { callback = listener; return 1; },
@@ -23,6 +24,7 @@ const tracker = {
 };
 const desktop = {
     active: () => active,
+    watchInput(cb) { touch = cb; return () => { touch = null; }; },
     monitors: () => [
         {x: -1280, y: 0, width: 1280, height: 720, scale: 1.5},
         {x: 0, y: 0, width: 1920, height: 1080, scale: 1},
@@ -31,7 +33,7 @@ const desktop = {
     tracker: () => tracker,
     warp(x, y) {
         warps++;
-        if (mode === WarpMode.Delayed) {
+        if (mode === WarpMode.Delayed || mode === WarpMode.V4) {
             GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
                 position = [x, y, false];
                 callback?.();
@@ -45,15 +47,25 @@ const desktop = {
         }
     },
 };
+// An older companion answers an unknown method at the D-Bus boundary.
+class FixturePointer extends FlowPointer {
+    PreparePointerMonotonicAsync(args, call) {
+        if (mode === WarpMode.V4)
+            call.return_dbus_error('org.freedesktop.DBus.Error.UnknownMethod', 'PreparePointerMonotonic');
+        else
+            super.PreparePointerMonotonicAsync(args, call);
+    }
+}
 const panel = Gio.DBusExportedObject.wrapJSObject(`<node><interface name="org.openlogi.Test">
     <method name="Move"><arg type="i" direction="in"/><arg type="i" direction="in"/><arg type="b" direction="in"/></method>
     <method name="Mode"><arg type="s" direction="in"/></method>
     <method name="SimulateLateDelivery"><arg type="b" direction="in"/></method>
+    <method name="Position"><arg type="i" direction="out"/><arg type="i" direction="out"/></method>
     <method name="Stats"><arg type="u" direction="out"/><arg type="u" direction="out"/><arg type="i" direction="out"/><arg type="b" direction="out"/></method>
 </interface></node>`, {
-    Move(x, y, ctrl) { position = [x, y, ctrl]; },
+    Move(x, y, ctrl) { touch?.(); position = [x, y, ctrl]; },
     ModeAsync([value], call) {
-        if (value === 'enable') service = new FlowPointer(desktop);
+        if (value === 'enable') service = new FixturePointer(desktop);
         else if (value === 'disable') { service.destroy(); service = null; }
         else if (value === 'lock' || value === 'unlock') {
             active = value === 'unlock';
@@ -72,6 +84,7 @@ const panel = Gio.DBusExportedObject.wrapJSObject(`<node><interface name="org.op
         GLib.get_monotonic_time = enabled ? () => monotonicNow() + 2_000_000 : monotonicNow;
         Date.now = enabled ? () => wallNow() - 60_000 : wallNow;
     },
+    Position() { return position.slice(0, 2); },
     Stats() { return [reads, warps, tracking, callback !== null]; },
 });
 panel.export(Gio.DBus.session, '/org/openlogi/Test');

@@ -235,6 +235,12 @@ IDLE ──edge trigger──► REQUESTED ──Accept──► SWITCHING ─�
   edge; the receiver maps proportionally onto its own exposed edge segments
   (per-display segments, not a union bounding rect) and clamps to the
   nearest valid point.
+- Windows and GNOME Wayland with the version 6 companion prepare the entry
+  cursor before replying to a pointing-device request. An explicit cancel
+  before any device arrives can restore the previous position while the
+  destination pointer and layout are untouched. A late inventory report
+  never repeats a prepared move. Expiry releases the saved position because
+  the hardware switch may still have succeeded.
 
 ## Clipboard & files
 
